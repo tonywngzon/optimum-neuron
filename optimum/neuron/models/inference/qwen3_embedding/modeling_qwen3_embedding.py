@@ -190,6 +190,7 @@ class Qwen3NxDModelForCausalLMEmbedding(NxDModelForEmbeddingLM):
             on_device_sampling=on_device_sampling,
             fused_qkv=True,
             continuous_batching=continuous_batching,
+            embedding_model=True
         )
 
     
@@ -232,6 +233,6 @@ class Qwen3NxDModelForCausalLMEmbedding(NxDModelForEmbeddingLM):
         hidden_states = outputs.hidden_states
         return hidden_states
     
-    # def forward(self, input_ids, attention_mask=None, position_ids=None, seq_ids=None, sampling_params=None):
-    #     # vLLM compatibility: accept but ignore extra parameters
-    #     return self.encode(input_ids, attention_mask)
+    def forward(self, input_ids, attention_mask=None, position_ids=None, seq_ids=None, sampling_params=None):
+        # vLLM compatibility: accept but ignore extra parameters
+        return self.encode(input_ids, attention_mask)

@@ -123,6 +123,9 @@ neuron_parallel_compile = "optimum.neuron.utils.neuron_parallel_compile:main"
 [project.entry-points."vllm.platform_plugins"]
 optimum_neuron = "optimum.neuron.vllm.plugin:register"
 
+[project.entry-points."vllm.io_processor_plugins"]
+embedding = "optimum.neuron.vllm.embedding_io_processor:register"
+
 [tool.setuptools.dynamic]
 version = {attr = "optimum.neuron.version.__version__"}
 

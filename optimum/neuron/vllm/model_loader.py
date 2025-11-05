@@ -25,7 +25,7 @@ from vllm.sequence import CompletionSequenceGroupOutput, Logprob, SequenceOutput
 
 from ..cache.hub_cache import select_hub_cached_entries
 from ..configuration_utils import NeuronConfig
-from ..models.inference.modeling_utils import NeuronModelForCausalLM
+from ..models.inference.modeling_utils import (NeuronModelForCausalLM, NeuronModelForFeatureExtractionLM)
 from ..utils.system import get_available_cores
 from ..utils.version_utils import get_neuronxcc_version
 
@@ -87,7 +87,12 @@ class OptimumNeuronModelForCausalLM(nn.Module):
 
         restored_indices = torch.argsort(sorted_indices)
         if seq_ids.shape[0] != 1:
-            output = torch.index_select(output, 0, restored_indices)
+            if isinstance(output, torch.Tensor):
+                output = torch.index_select(output, 0, restored_indices)
+            elif isinstance(output, list):
+                output = output[0]
+                if isinstance(output, torch.Tensor):
+                    output = torch.index_select(output, 0, restored_indices)
 
         return output
 
@@ -167,11 +172,18 @@ def get_optimum_neuron_model(
     except Exception:
         neuron_config = None
     if neuron_config is not None:
-        neuron_model = NeuronModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            revision=revision,
-            token=token,
-        )
+        try:
+            neuron_model = NeuronModelForFeatureExtractionLM.from_pretrained(
+                model_name_or_path,
+                revision=revision,
+                token=token,
+            )
+        except:
+            neuron_model = NeuronModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                revision=revision,
+                token=token,
+            )
     else:
         # Model needs to be exported: look for compatible hub cached configs
         batch_size = scheduler_config.max_num_seqs

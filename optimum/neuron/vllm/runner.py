@@ -46,13 +46,14 @@ class ModelInputForOptimumNeuron(ModelRunnerInputBase):
     position_ids: torch.Tensor | None = None
     seq_ids: torch.Tensor | None = None
     sampling_metadata: SamplingMetadata | None = None
+    request_ids: list[str] | None = None
 
     def as_broadcastable_tensor_dict(self) -> dict[str, int | torch.Tensor]:
         return {
             "input_ids": self.input_ids,
             "position_ids": self.position_ids,
             "seq_ids": self.seq_ids,
-            "sampling_metadata": self.sampling_metadata,
+            "request_ids": self.request_ids,
         }
 
     @classmethod
@@ -65,7 +66,7 @@ class ModelInputForOptimumNeuron(ModelRunnerInputBase):
             input_ids=tensor_dict["input_ids"],
             position_ids=tensor_dict["position_ids"],
             seq_ids=tensor_dict["seq_ids"],
-            sampling_metadata=tensor_dict["sampling_metadata"],
+            request_ids=tensor_dict.get("request_ids"),
         )
 
 
@@ -155,23 +156,36 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
             sampling_params = torch.zeros((batch_size, 3), dtype=torch.float32, device=self.device)
         else:
             sampling_params = self.get_nxd_sampling_params(model_input.sampling_metadata)
-
+        
         hidden_states = self.model(
             input_ids=model_input.input_ids,
             position_ids=model_input.position_ids,
             seq_ids=model_input.seq_ids,
             sampling_params=sampling_params,
         )
-
         if is_embedding_model:
-            # For embedding models, return embeddings directly without sampling
-            return [hidden_states]
-        
+            from vllm.sequence import CompletionSequenceGroupOutput, SequenceOutput, Logprob
+            from .embedding_cache import store_embeddings
+            
+            request_ids = model_input.request_ids or []
+            embeddings = [hidden_states[i].tolist() for i in range(len(request_ids))]
+            store_embeddings(request_ids, embeddings)
+            
+            outputs = []
+            for i in range(len(request_ids)):
+                outputs.append(CompletionSequenceGroupOutput(
+                    samples=[SequenceOutput(
+                        parent_seq_id=i,
+                        output_token=0,
+                        logprobs={0: Logprob(0)}
+                    )],
+                    prompt_logprobs=None
+                ))
+            return [SamplerOutput(outputs=outputs)]
         output = self.model.sample(
             logits=hidden_states,
             sampling_metadata=model_input.sampling_metadata,
         )
-
         return [output]
 
     def make_model_input_from_broadcasted_tensor_dict(self, tensor_dict: dict[str, Any]) -> ModelInputForOptimumNeuron:
@@ -180,14 +194,16 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
     def _prepare_prompt(
         self,
         seq_group_metadata_list: list[SequenceGroupMetadata],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[str]]:
         assert len(seq_group_metadata_list) > 0
         input_tokens: list[list[int]] = []
         input_positions: list[list[int]] = []
         input_block_ids: list[int] = []
+        request_ids: list[str] = []
 
         seq_lens: list[int] = []
         for seq_group_metadata in seq_group_metadata_list:
+            request_ids.append(seq_group_metadata.request_id)
             assert seq_group_metadata.is_prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
             assert len(seq_ids) == 1
@@ -201,10 +217,14 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
             input_tokens.append(prompt_tokens)
             input_positions.append(list(range(seq_len)))
 
-            assert seq_group_metadata.block_tables is not None
-            block_table = seq_group_metadata.block_tables[seq_id]
-            assert len(block_table) == 1
-            input_block_ids.append(block_table[0])
+            if seq_group_metadata.block_tables is not None and seq_id in seq_group_metadata.block_tables:
+                block_table = seq_group_metadata.block_tables[seq_id]
+                if block_table is not None and len(block_table) == 1:
+                    input_block_ids.append(block_table[0])
+                else:
+                    input_block_ids.append(0)
+            else:
+                input_block_ids.append(0)
 
         max_seq_len = max(seq_lens)
         assert max_seq_len > 0
@@ -216,7 +236,7 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
         )
         seq_ids = torch.tensor(input_block_ids, dtype=torch.long, device=self.device)
 
-        return (input_ids, position_ids, seq_ids, seq_lens)
+        return (input_ids, position_ids, seq_ids, seq_lens, request_ids)
 
     def _prepare_decode(
         self,
@@ -241,10 +261,14 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
                 position = seq_len - 1
                 input_positions.append([position])
 
-                assert seq_group_metadata.block_tables is not None
-                block_table = seq_group_metadata.block_tables[seq_id]
-                assert len(block_table) == 1
-                input_block_ids.append(block_table[0])
+                if seq_group_metadata.block_tables is not None and seq_id in seq_group_metadata.block_tables:
+                    block_table = seq_group_metadata.block_tables[seq_id]
+                    if block_table is not None and len(block_table) == 1:
+                        input_block_ids.append(block_table[0])
+                    else:
+                        input_block_ids.append(0)
+                else:
+                    input_block_ids.append(0)
 
         input_ids = make_tensor_with_pad(input_tokens, pad=0, max_len=1, dtype=torch.long, device=self.device)
         position_ids = make_tensor_with_pad(input_positions, pad=0, max_len=1, dtype=torch.long, device=self.device)
@@ -263,10 +287,11 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
         is_prompt = seq_group_metadata_list[0].is_prompt
         # Prepare input tensors.
         if is_prompt:
-            (input_ids, position_ids, seq_ids, seq_lens) = self._prepare_prompt(seq_group_metadata_list)
+            (input_ids, position_ids, seq_ids, seq_lens, request_ids) = self._prepare_prompt(seq_group_metadata_list)
         else:
             (input_ids, position_ids, seq_ids) = self._prepare_decode(seq_group_metadata_list)
             seq_lens = None
+            request_ids = [sg.request_id for sg in seq_group_metadata_list]
 
         is_embedding_model = getattr(self.model.model.neuron_config, 'embedding_model', False)
         
@@ -278,12 +303,9 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
                 sampling_params.top_p = top_p
                 sampling_params.temperature = temperature
 
-        sampling_metadata = SamplingMetadata.prepare(
+        sampling_metadata = None if is_embedding_model else SamplingMetadata.prepare(
             seq_group_metadata_list,
             seq_lens,
-            # query_lens is not needed if chunked prefill is not
-            # supported. Since neuron worker doesn't support chunked prefill
-            # just use seq_lens instead.
             seq_lens,
             self.device,
             self.pin_memory,
@@ -291,7 +313,8 @@ class OptimumNeuronModelRunner(ModelRunnerBase[ModelInputForOptimumNeuron]):
         )
 
         return ModelInputForOptimumNeuron(
-            input_ids=input_ids, position_ids=position_ids, seq_ids=seq_ids, sampling_metadata=sampling_metadata
+            input_ids=input_ids, position_ids=position_ids, seq_ids=seq_ids, 
+            sampling_metadata=sampling_metadata, request_ids=request_ids
         )
 
     def remove_all_loras(self):
